@@ -225,11 +225,11 @@ class Command(LabelCommand):
                     print("Skipping '%s' - no index." % model)
                 continue
 
-            if self.workers > 0:
-                # workers resetting connections leads to references to models / connections getting
-                # stale and having their connection disconnected from under them. Resetting before
-                # the loop continues and it accesses the ORM makes it better.
-                db.close_connection()
+            # if self.workers > 0:
+            #     # workers resetting connections leads to references to models / connections getting
+            #     # stale and having their connection disconnected from under them. Resetting before
+            #     # the loop continues and it accesses the ORM makes it better.
+            #     db.close_connection()
 
             qs = index.build_queryset(using=using, start_date=self.start_date,
                                       end_date=self.end_date)
@@ -254,7 +254,7 @@ class Command(LabelCommand):
                 # single-query, still-batched
                 start = 0
                 with server_side_cursors():
-                    with transaction.atomic():
+                    #with transaction.atomic():
                         items = qs.iterator()  # prevents filling query-cache
                         while True:
                             added = do_update_batch(backend, index, items, start, batch_size, total, self.verbosity)

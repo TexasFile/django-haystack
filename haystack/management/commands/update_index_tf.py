@@ -183,6 +183,10 @@ class Command(BaseCommand):
             type=int, default=DEFAULT_MAX_RETRIES,
             help='Maximum number of attempts to write to the backend when an error occurs.'
         )
+        parser.add_argument(
+            '--use_iterators', action='store_true', dest='use_iterators',
+            default=False, help='Will enable use of iterators for performance'
+        )
 
     def handle(self, **options):
         self.verbosity = int(options.get('verbosity', 1))
@@ -193,6 +197,7 @@ class Command(BaseCommand):
         self.workers = options.get('workers', 0)
         self.commit = options.get('commit', True)
         self.max_retries = options.get('max_retries', DEFAULT_MAX_RETRIES)
+        self.use_iterators = options.get('use_iterators', False)
 
         self.backends = options.get('using')
         if not self.backends:
@@ -230,12 +235,120 @@ class Command(BaseCommand):
         for label in labels:
             for using in self.backends:
                 try:
-                    self.update_backend(label, using)
+                    if self.use_iterators:
+                        self.update_backend_using_iterators(label, using)
+                    else:
+                        self.update_backend(label, using)
                 except:
                     LOG.exception("Error updating %s using %s ", label, using)
                     raise
 
     def update_backend(self, label, using):
+        backend = haystack_connections[using].get_backend()
+        unified_index = haystack_connections[using].get_unified_index()
+
+        for model in haystack_get_models(label):
+            try:
+                index = unified_index.get_index(model)
+            except NotHandled:
+                if self.verbosity >= 2:
+                    self.stdout.write("Skipping '%s' - no index." % model)
+                continue
+
+            if self.workers > 0:
+                # workers resetting connections leads to references to models / connections getting
+                # stale and having their connection disconnected from under them. Resetting before
+                # the loop continues and it accesses the ORM makes it better.
+                close_old_connections()
+
+            qs = index.build_queryset(using=using, start_date=self.start_date,
+                                      end_date=self.end_date)
+
+            total = qs.count()
+
+            if self.verbosity >= 1:
+                self.stdout.write(u"Indexing %d %s" % (
+                    total, force_text(model._meta.verbose_name_plural))
+                )
+
+            batch_size = self.batchsize or backend.batch_size
+
+            if self.workers > 0:
+                ghetto_queue = []
+
+            else:
+                with server_side_cursors(qs, itersize=batch_size):
+                    for start in range(0, total, batch_size):
+                        end = min(start + batch_size, total)
+                        do_update(backend, index, qs, start, end, total, verbosity=self.verbosity,
+                                  commit=self.commit, max_retries=self.max_retries)
+
+            if self.workers > 0:
+                pool = multiprocessing.Pool(self.workers)
+
+                successful_tasks = pool.map(update_worker, ghetto_queue)
+
+                if len(ghetto_queue) != len(successful_tasks):
+                    self.stderr.write('Queued %d tasks but only %d completed' % (len(ghetto_queue),
+                                                                                 len(successful_tasks)))
+                    for i in ghetto_queue:
+                        if i not in successful_tasks:
+                            self.stderr.write('Incomplete task: %s' % repr(i))
+
+                pool.close()
+                pool.join()
+
+            if self.remove:
+                if self.start_date or self.end_date or total <= 0:
+                    # They're using a reduced set, which may not incorporate
+                    # all pks. Rebuild the list with everything.
+                    qs = index.index_queryset().values_list('pk', flat=True)
+                    database_pks = set(smart_bytes(pk) for pk in qs)
+
+                    total = len(database_pks)
+                else:
+                    database_pks = set(smart_bytes(pk) for pk in qs.values_list('pk', flat=True))
+
+                # Since records may still be in the search index but not the local database
+                # we'll use that to create batches for processing.
+                # See https://github.com/django-haystack/django-haystack/issues/1186
+                index_total = SearchQuerySet(using=backend.connection_alias).models(model).count()
+
+                # Retrieve PKs from the index. Note that this cannot be a numeric range query because although
+                # pks are normally numeric they can be non-numeric UUIDs or other custom values. To reduce
+                # load on the search engine, we only retrieve the pk field, which will be checked against the
+                # full list obtained from the database, and the id field, which will be used to delete the
+                # record should it be found to be stale.
+                index_pks = SearchQuerySet(using=backend.connection_alias).models(model)
+                index_pks = index_pks.values_list('pk', 'id')
+
+                # We'll collect all of the record IDs which are no longer present in the database and delete
+                # them after walking the entire index. This uses more memory than the incremental approach but
+                # avoids needing the pagination logic below to account for both commit modes:
+                stale_records = set()
+
+                for start in range(0, index_total, batch_size):
+                    upper_bound = start + batch_size
+
+                    # If the database pk is no longer present, queue the index key for removal:
+                    for pk, rec_id in index_pks[start:upper_bound]:
+                        if smart_bytes(pk) not in database_pks:
+                            stale_records.add(rec_id)
+
+                if stale_records:
+                    if self.verbosity >= 1:
+                        self.stdout.write("  removing %d stale records." % len(stale_records))
+
+                    for rec_id in stale_records:
+                        # Since the PK was not in the database list, we'll delete the record from the search
+                        # index:
+                        if self.verbosity >= 2:
+                            self.stdout.write("  removing %s." % rec_id)
+
+                        backend.remove(rec_id, commit=self.commit)
+
+
+    def update_backend_using_iterators(self, label, using):
         backend = haystack_connections[using].get_backend()
         unified_index = haystack_connections[using].get_unified_index()
 

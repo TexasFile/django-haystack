@@ -20,6 +20,7 @@ from haystack.utils.app_loading import haystack_get_models, haystack_load_apps
 # extra imports needed for performance
 from haystack.utils.ssc import *
 from itertools import islice
+from django.db import transaction
 
 DEFAULT_BATCH_SIZE = None
 DEFAULT_AGE = None
@@ -70,9 +71,9 @@ def do_update(backend, index, qs, start, end, total, verbosity=1, commit=True,
 
     # Get a clone of the QuerySet so that the cache doesn't bloat up
     # in memory. Useful when reindexing large amounts of data.
-    small_cache_qs = qs.all()
-    current_qs = small_cache_qs[start:end]
-
+    #small_cache_qs = qs #.iterator()
+    #current_qs = qs[start:end]
+    current_qs = list(islice(qs, end - start))
     is_parent_process = hasattr(os, 'getppid') and os.getpid() == os.getppid()
 
     if verbosity >= 2:
@@ -278,9 +279,10 @@ class Command(BaseCommand):
 
             else:
                 with server_side_cursors(qs, itersize=batch_size):
+                    qsi = qs.iterator()
                     for start in range(0, total, batch_size):
                         end = min(start + batch_size, total)
-                        do_update(backend, index, qs, start, end, total, verbosity=self.verbosity,
+                        do_update(backend, index, qsi, start, end, total, verbosity=self.verbosity,
                                   commit=self.commit, max_retries=self.max_retries)
 
             if self.workers > 0:
@@ -383,16 +385,17 @@ class Command(BaseCommand):
 
             else:
                 start = 0
-                with server_side_cursors(qs, itersize=batch_size):
-                    items = qs.iterator()  # prevents filling query-cache
+                with transaction.atomic(qs.db):
+                    with server_side_cursors(qs, itersize=batch_size):
+                        items = qs.iterator()  # prevents filling query-cache
 
-                    while True:
-                        added = do_update_batch(backend, index, items, start, batch_size, total, self.verbosity)
+                        while True:
+                            added = do_update_batch(backend, index, items, start, batch_size, total, self.verbosity)
 
-                        if added > 0:
-                            start += added
-                            continue
-                        break
+                            if added > 0:
+                                start += added
+                                continue
+                            break
 
                     # original method that works but does not use iterators
                     #

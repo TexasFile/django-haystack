@@ -184,7 +184,7 @@ class Command(BaseCommand):
             help='Maximum number of attempts to write to the backend when an error occurs.'
         )
         parser.add_argument(
-            '--use_iterators', action='store_true', dest='use_iterators',
+            '--use-iterators', action='store_true', dest='use_iterators',
             default=False, help='Will enable use of iterators for performance'
         )
 

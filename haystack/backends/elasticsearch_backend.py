@@ -47,6 +47,7 @@ DATETIME_REGEX = re.compile(
 
 class ElasticsearchSearchBackend(BaseSearchBackend):
     # Word reserved by Elasticsearch for special use.
+    DOC_TYPE = 'modelresult'
     RESERVED_WORDS = ("AND", "NOT", "OR", "TO")
 
     # Characters reserved by Elasticsearch for special use.
@@ -160,7 +161,10 @@ class ElasticsearchSearchBackend(BaseSearchBackend):
         self.content_field_name, field_mapping = self.build_schema(
             unified_index.all_searchfields()
         )
-        current_mapping = {"modelresult": {"properties": field_mapping}}
+        if self.DOC_TYPE:
+            current_mapping = {self.DOC_TYPE: {"properties": field_mapping}}
+        else:
+            current_mapping = {"properties": field_mapping}
 
         if current_mapping != self.existing_mapping:
             try:
@@ -168,8 +172,9 @@ class ElasticsearchSearchBackend(BaseSearchBackend):
                 self.conn.indices.create(
                     index=self.index_name, body=self.DEFAULT_SETTINGS, ignore=400
                 )
+                extra = {'doc_type': self.DOC_TYPE} if self.DOC_TYPE else {}
                 self.conn.indices.put_mapping(
-                    index=self.index_name, doc_type="modelresult", body=current_mapping
+                    index=self.index_name, body=current_mapping, **extra
                 )
                 self.existing_mapping = current_mapping
             except Exception:
@@ -219,7 +224,8 @@ class ElasticsearchSearchBackend(BaseSearchBackend):
                     extra={"data": {"index": index, "object": get_identifier(obj)}},
                 )
 
-        bulk(self.conn, prepped_docs, index=self.index_name, doc_type="modelresult")
+        extra = {'doc_type': self.DOC_TYPE} if self.DOC_TYPE else {}
+        bulk(self.conn, prepped_docs, index=self.index_name, **extra)
 
         if commit:
             self.conn.indices.refresh(index=self.index_name)
@@ -243,8 +249,9 @@ class ElasticsearchSearchBackend(BaseSearchBackend):
                 return
 
         try:
+            extra = {'doc_type': self.DOC_TYPE} if self.DOC_TYPE else {}
             self.conn.delete(
-                index=self.index_name, doc_type="modelresult", id=doc_id, ignore=404
+                index=self.index_name, id=doc_id, ignore=404, **extra
             )
 
             if commit:
@@ -285,8 +292,9 @@ class ElasticsearchSearchBackend(BaseSearchBackend):
                 query = {
                     "query": {"query_string": {"query": " OR ".join(models_to_delete)}}
                 }
+                extra = {'doc_type': self.DOC_TYPE} if self.DOC_TYPE else {}
                 self.conn.delete_by_query(
-                    index=self.index_name, doc_type="modelresult", body=query
+                    index=self.index_name, body=query, **extra
                 )
         except elasticsearch.TransportError as e:
             if not self.silently_fail:
@@ -555,11 +563,12 @@ class ElasticsearchSearchBackend(BaseSearchBackend):
             search_kwargs["size"] = end_offset - start_offset
 
         try:
+            extra = {'doc_type': self.DOC_TYPE} if self.DOC_TYPE else {}
             raw_results = self.conn.search(
                 body=search_kwargs,
                 index=self.index_name,
-                doc_type="modelresult",
                 _source=True,
+                **extra
             )
         except elasticsearch.TransportError as e:
             if not self.silently_fail:
@@ -607,7 +616,7 @@ class ElasticsearchSearchBackend(BaseSearchBackend):
             .get_index(model_klass)
         )
         field_name = index.get_content_field()
-        params = {}
+        params = {'doc_type': self.DOC_TYPE} if self.DOC_TYPE else {}
 
         if start_offset is not None:
             params["search_from"] = start_offset
@@ -639,6 +648,9 @@ class ElasticsearchSearchBackend(BaseSearchBackend):
 
         return self._process_results(raw_results, result_class=result_class)
 
+    def _get_results_count(self, results):
+        return results.get("hits", {}).get("total", 0)
+
     def _process_results(
         self,
         raw_results,
@@ -650,7 +662,7 @@ class ElasticsearchSearchBackend(BaseSearchBackend):
         from haystack import connections
 
         results = []
-        hits = raw_results.get("hits", {}).get("total", 0)
+        hits = self._get_results_count(raw_results)
         facets = {}
         spelling_suggestion = None
 
